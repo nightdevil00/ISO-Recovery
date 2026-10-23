@@ -11,6 +11,7 @@ Target: **Windows 10/11, UEFI + GPT**. Validated against `omarchy-4.0.6.iso`.
 | `omarchy_iso_boot.py` | **the program** — GUI + CLI, Python 3.9+, no dependencies |
 | `Run GUI.bat` | double-click launcher for the GUI |
 | `Install-LinuxBootPartition.ps1` | older headless PowerShell version (Omarchy labels hard-coded) |
+| `screenshots/` | walkthrough images used in [Step by step](#step-by-step-with-screenshots) |
 
 ## Requirements
 
@@ -37,6 +38,56 @@ The app opens **read-only** and:
 
 Then click **Relaunch as Administrator** and **Create bootable partition**.
 The Create button stays disabled until everything checks out.
+
+## Step by step (with screenshots)
+
+### 1. Prepare the disk — shrink a volume first
+
+The tool only uses **unallocated** space; it never resizes or moves a partition.
+If the target disk has no free space, shrink an existing volume first:
+
+1. Right-click **Start → Disk Management** (or press `Win+X`, then `K`).
+2. Right-click the volume you want to shrink (usually `C:`) → **Shrink Volume**.
+3. Shrink by at least **20 GB** — that covers the 1 GB loader, the ~9 GB ISO
+   store, and leaves room for the real Linux install. More is better.
+4. Leave the freed space **unallocated**. Do not create a new volume in it.
+
+[![Disk preparation: shrink a volume in Disk Management](screenshots/disk_preparation.png)](screenshots/disk_preparation.png)
+
+### 2. Run it as Administrator and select the ISO
+
+Start the GUI, then click **Relaunch as Administrator** (the status strip must say
+`Administrator: yes`). Use **Browse…** to pick your ISO, then **Inspect**.
+
+Check the image details panel: it shows the kernel, initramfs, marker, generated
+volume labels and the boot-entry name. If the ISO is not archiso-based, the app
+refuses it here — before anything is written.
+
+[![Select the ISO and inspect it in the main window](screenshots/GUI.png)](screenshots/GUI.png)
+
+### 3. Choose the disk and click Create bootable partition
+
+Pick the disk that has the unallocated space. The layout line must be green and
+show enough room left over for the installation. Then click
+**Create bootable partition**.
+
+### 4. Confirm
+
+The confirmation lists exactly what will be created: the FAT32 loader, the ISO
+store, the copy, and the UEFI boot entry. Approve it to start.
+
+[![Confirmation dialog](screenshots/accept.png)](screenshots/accept.png)
+
+### 5. Finish
+
+The log shows each step, then a completion dialog. Reboot, open the firmware boot
+menu (`F12` / `F11` / `Esc`) and choose the entry named after your ISO.
+
+[![Completion dialog](screenshots/finish.png)](screenshots/finish.png)
+
+> Screenshots live in `screenshots/` next to this README. Replace them with your
+> own capture using the same file names if you want to update the walkthrough.
+
 
 ## What it creates
 
