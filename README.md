@@ -11,7 +11,7 @@ Target: **Windows 10/11, UEFI + GPT**. Validated against `omarchy-4.0.6.iso`.
 | `omarchy_iso_boot.py` | **the program** — GUI + CLI, Python 3.9+, no dependencies |
 | `Run GUI.bat` | double-click launcher for the GUI |
 | `Install-LinuxBootPartition.ps1` | older headless PowerShell version (Omarchy labels hard-coded) |
-| `screenshots/` | walkthrough images used in [Step by step](#step-by-step-with-screenshots) |
+| `screenshots/` | walkthrough images for [setup](#step-by-step-with-screenshots) and [first boot](#first-boot-with-screenshots) |
 
 ## Requirements
 
@@ -236,6 +236,31 @@ not have the preflight/GUID protections above. Prefer the Python program.
 
 Reboot and press **F12 / F11 / Esc**, then choose the entry named after your ISO,
 e.g. **"Omarchy 4.0.6 (live ISO on disk)"**.
+
+## First boot (with screenshots)
+
+### 1. Pick the entry in the firmware boot menu
+
+Open the one-time boot menu (`F12` / `F11` / `Esc`, depending on the vendor) and
+select the entry this tool created — it is named after your ISO.
+
+[![Firmware boot menu with the created entry selected](screenshots/bootmenu.jpg)](screenshots/bootmenu.jpg)
+
+### 2. Pick the first GRUB entry
+
+The ISO's GRUB menu appears. Choose the first entry,
+**“boot live ISO from disk”** (or let the 10-second timeout pick it for you).
+The second entry is the UUID fallback used only if the first one fails.
+
+[![GRUB menu with the first boot entry highlighted](screenshots/grub_mode.jpg)](screenshots/grub_mode.jpg)
+
+### 3. Omarchy starts
+
+The archiso initramfs loop-mounts the ISO from the store partition and boots the
+live environment. The first Omarchy screen means the whole chain worked: firmware
+→ FAT32 loader → ISO GRUB → NTFS store → live system.
+
+[![Omarchy live environment first screen](screenshots/omarchy_setup.jpg)](screenshots/omarchy_setup.jpg)
 
 ## Installing Omarchy for real
 
