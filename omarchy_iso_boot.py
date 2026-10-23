@@ -17,6 +17,7 @@ Requires: Windows, Python 3.9+, UEFI + GPT, Administrator for the write steps.
 
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import datetime
 import hashlib
@@ -37,8 +38,9 @@ from typing import Callable, Optional
 
 # --------------------------------------------------------------- constants ---
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 APP_TITLE = "Linux ISO Boot Installer"
+IS_WINDOWS = sys.platform == "win32"
 ENTRY_PATH = r"\EFI\BOOT\BOOTx64.EFI"
 ENTRY_SUFFIX = "(live ISO on disk)"
 # Labels used by versions before 1.1.0; still cleaned up so an upgrade never
@@ -46,7 +48,7 @@ ENTRY_SUFFIX = "(live ISO on disk)"
 LEGACY_LABELS = ("OMARCHYBOOT", "OMARCHY_ISO")
 
 PROGRAM_DATA = os.environ.get("ProgramData", r"C:\ProgramData")
-STATE_DIR = Path(PROGRAM_DATA) / "LinuxBootPartition"
+STATE_DIR = Path(PROGRAM_DATA) / "LinuxBootPartition" if IS_WINDOWS else Path("/var/lib/linux-iso-boot")
 STATE_FILE = STATE_DIR / "state.json"
 CACHE_DIR = Path(tempfile.gettempdir()) / "omarchy_iso_boot"
 
@@ -63,18 +65,33 @@ class ToolError(RuntimeError):
 
 def run(args: list[str], timeout: int = 900) -> str:
     """Run a command, return stdout+stderr, raise ToolError on failure."""
-    proc = subprocess.run(
-        args,
-        capture_output=True,
-        text=True,
-        errors="replace",
-        timeout=timeout,
-        creationflags=NO_WINDOW,
-    )
+    try:
+        proc = subprocess.run(
+            args,
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=timeout,
+            creationflags=NO_WINDOW if IS_WINDOWS else 0,
+        )
+    except FileNotFoundError:
+        raise ToolError(f"'{args[0]}' is not installed.") from None
     out = (proc.stdout or "") + (proc.stderr or "")
     if proc.returncode != 0:
         raise ToolError(f"Command failed ({proc.returncode}): {' '.join(args[:3])}\n{out.strip()}")
     return out
+
+
+def capture(args: list[str], timeout: int = 900) -> str:
+    """Run a command and return stdout only, raise ToolError on failure."""
+    try:
+        proc = subprocess.run(args, capture_output=True, text=True, errors="replace", timeout=timeout)
+    except FileNotFoundError:
+        raise ToolError(f"'{args[0]}' is not installed.") from None
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()
+        raise ToolError(f"Command failed ({proc.returncode}): {' '.join(args[:3])}\n{detail}")
+    return proc.stdout
 
 
 def ps(script: str, timeout: int = 900) -> str:
@@ -147,6 +164,8 @@ def entry_description(iso_name: str) -> str:
 
 def downloads_dir() -> Path:
     """The real Downloads folder (OneDrive may have redirected it)."""
+    if not IS_WINDOWS:
+        return _linux_downloads_dir()
     try:
         class _GUID(ctypes.Structure):
             _fields_ = [
@@ -186,6 +205,8 @@ def find_boot_entries(description: str, contains: bool = True) -> list[str]:
     listing into blocks on the dashed separators and search the whole block for
     the description text itself.
     """
+    if not IS_WINDOWS:
+        return _linux_find_boot_entries(description)
     try:
         out = run(["bcdedit", "/enum", "all"])
     except ToolError:
@@ -202,6 +223,8 @@ def find_boot_entries(description: str, contains: bool = True) -> list[str]:
 
 
 def is_admin() -> bool:
+    if not IS_WINDOWS:
+        return os.geteuid() == 0
     try:
         return bool(ctypes.windll.shell32.IsUserAnAdmin())
     except Exception:
@@ -210,6 +233,9 @@ def is_admin() -> bool:
 
 def relaunch_as_admin() -> None:
     """Re-launch this script (or EXE) elevated, keeping the same arguments."""
+    if not IS_WINDOWS:
+        _relaunch_linux()
+        return
     if getattr(sys, "frozen", False):
         exe = sys.executable
         params = " ".join(f'"{a}"' for a in sys.argv[1:])
@@ -223,6 +249,8 @@ def relaunch_as_admin() -> None:
 # ------------------------------------------------------------ system probe ---
 
 def get_firmware_type() -> str:
+    if not IS_WINDOWS:
+        return "UEFI" if Path("/sys/firmware/efi").is_dir() else "BIOS"
     try:
         out = ps("(Get-ComputerInfo -Property BiosFirmwareType).BiosFirmwareType").strip()
         return out or "unknown"
@@ -232,6 +260,8 @@ def get_firmware_type() -> str:
 
 def get_secure_boot() -> Optional[bool]:
     """True/False, or None when it cannot be determined (needs admin)."""
+    if not IS_WINDOWS:
+        return _linux_secure_boot()
     try:
         out = ps("try { Confirm-SecureBootUEFI } catch { 'unknown' }").strip().lower()
     except Exception:
@@ -244,6 +274,8 @@ def get_secure_boot() -> Optional[bool]:
 
 
 def list_disks() -> list[dict]:
+    if not IS_WINDOWS:
+        return _linux_list_disks()
     return ps_json("""
 $out = @(
   Get-Disk | ForEach-Object {
@@ -262,6 +294,8 @@ ConvertTo-Json -InputObject $out -Compress -Depth 4
 
 
 def list_partitions(disk_number: int) -> list[dict]:
+    if not IS_WINDOWS:
+        return _linux_partitions(disk_number)
     return ps_json(fill("""
 $out = @(
   Get-Partition -DiskNumber {{disk}} | ForEach-Object {
@@ -283,6 +317,10 @@ _SYS_DISK: dict = {}
 def system_disk_number() -> Optional[int]:
     if "value" in _SYS_DISK:
         return _SYS_DISK["value"]
+    if not IS_WINDOWS:
+        value = _linux_system_disk()
+        _SYS_DISK["value"] = value
+        return value
     drive = os.environ.get("SystemDrive", "C:").rstrip(":")
     try:
         out = ps(f"(Get-Partition -DriveLetter {drive} -ErrorAction SilentlyContinue).DiskNumber")
@@ -291,6 +329,299 @@ def system_disk_number() -> Optional[int]:
         value = None
     _SYS_DISK["value"] = value
     return value
+
+
+# ----------------------------------------------------------- linux backend ---
+#
+# Disks are identified by device path ("/dev/sda") and partitions by their GPT
+# PARTUUID, which lsblk reports. Partitioning uses sgdisk, formatting uses
+# mkfs.*, the UEFI entry uses efibootmgr, and the ISO is read with bsdtar, so no
+# ISO mount is needed.
+
+LINUX_TOOLS = {
+    "sgdisk": "gptfdisk",
+    "parted": "parted",
+    "partprobe": "parted",
+    "mkfs.vfat": "dosfstools",
+    "mkfs.ntfs": "ntfsprogs",
+    "mkfs.exfat": "exfatprogs",
+    "efibootmgr": "efibootmgr",
+    "bsdtar": "libarchive",
+    "blkid": "util-linux",
+    "lsblk": "util-linux",
+    "findmnt": "util-linux",
+    "udevadm": "systemd",
+    "pkexec": "polkit",
+}
+SECURE_BOOT_VAR = "/sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c"
+EFI_ENTRY_RE = re.compile(r"^Boot([0-9A-Fa-f]{4})\*?\s+(.*)$")
+
+
+def missing_linux_tools() -> list[str]:
+    if IS_WINDOWS:
+        return []
+    return [tool for tool in LINUX_TOOLS if shutil.which(tool) is None]
+
+
+def linux_install_hint() -> str:
+    packages = sorted({LINUX_TOOLS[tool] for tool in missing_linux_tools()})
+    return "sudo pacman -S --needed " + " ".join(packages)
+
+
+def _lsblk(*targets: str, disks_only: bool = False) -> list[dict]:
+    args = ["lsblk", "-J", "-b", "-p", "-o", "PATH,PARTUUID,LABEL,TYPE,SIZE,PTTYPE,MODEL,TRAN"]
+    if disks_only:
+        args.append("-d")
+    args += list(targets)
+    return json.loads(capture(args) or "{}").get("blockdevices", [])
+
+
+def _linux_home() -> Path:
+    uid = os.environ.get("PKEXEC_UID") or os.environ.get("SUDO_UID")
+    if uid:
+        import pwd
+        try:
+            return Path(pwd.getpwuid(int(uid)).pw_dir)
+        except (KeyError, ValueError):
+            pass
+    return Path.home()
+
+
+def _linux_downloads_dir() -> Path:
+    home = _linux_home()
+    try:
+        for line in (home / ".config" / "user-dirs.dirs").read_text(encoding="utf-8").splitlines():
+            match = re.match(r'\s*XDG_DOWNLOAD_DIR="(.*)"', line)
+            if match:
+                value = Path(match.group(1).replace("$HOME", str(home)))
+                if value.is_dir():
+                    return value
+    except OSError:
+        pass
+    return home / "Downloads"
+
+
+def _linux_secure_boot() -> Optional[bool]:
+    try:
+        data = Path(SECURE_BOOT_VAR).read_bytes()
+    except OSError:
+        return None
+    return bool(data[-1]) if len(data) == 5 else None
+
+
+def _linux_free_sizes(disk: str) -> list[int]:
+    """Sizes in bytes of every unpartitioned gap on the disk."""
+    try:
+        out = capture(["parted", "-sm", disk, "unit", "B", "print", "free"])
+    except ToolError:
+        return []
+    sizes = []
+    for line in out.splitlines():
+        fields = line.rstrip(";").split(":")
+        if len(fields) >= 5 and fields[4] == "free":
+            sizes.append(int(fields[3].rstrip("B")))
+    return sizes
+
+
+def _linux_list_disks() -> list[dict]:
+    disks = []
+    for dev in _lsblk(disks_only=True):
+        if dev.get("type") != "disk" or dev["path"].startswith("/dev/zram"):
+            continue
+        size = int(dev.get("size") or 0)
+        free = _linux_free_sizes(dev["path"])
+        disks.append({
+            "number": dev["path"],
+            "model": (dev.get("model") or "").strip() or dev["path"],
+            "sizeGB": round(size / GIB, 1),
+            # The largest gap, because a partition must fit in one contiguous run.
+            "freeGB": round(max(free, default=0) / GIB, 1),
+            "style": (dev.get("pttype") or "none").upper(),
+            "bus": (dev.get("tran") or "").upper(),
+        })
+    return disks
+
+
+def _lsblk_walk(nodes: list[dict]):
+    """Every device in an lsblk tree. lsblk nests children only when NAME is shown."""
+    for node in nodes:
+        yield node
+        yield from _lsblk_walk(node.get("children", []))
+
+
+def _linux_partitions(disk: str) -> list[dict]:
+    parts = []
+    for child in _lsblk_walk(_lsblk(disk)):
+        if child.get("type") != "part" or child["path"] == disk:
+            continue
+        number = re.search(r"(\d+)$", child["path"])
+        parts.append({
+            "number": int(number.group(1)) if number else 0,
+            "path": child["path"],
+            "guid": (child.get("partuuid") or "").lower(),
+            "label": child.get("label") or "",
+            "letter": "",
+            "sizeGB": round(int(child.get("size") or 0) / GIB, 2),
+            "type": "part",
+        })
+    return parts
+
+
+def _linux_disk_of(dev: str) -> Optional[str]:
+    """Walk up from a partition or mapper device to its physical disk."""
+    for _ in range(16):
+        fields = capture(["lsblk", "-ndo", "PKNAME,TYPE", dev]).split()
+        if not fields:
+            return None
+        if fields[-1] == "disk":
+            return dev
+        if len(fields) < 2:
+            return None
+        dev = f"/dev/{fields[0]}"
+    return None
+
+
+def _linux_system_disk() -> Optional[str]:
+    try:
+        source = capture(["findmnt", "-no", "SOURCE", "/"]).strip().split("[")[0]
+        return _linux_disk_of(source) if source.startswith("/dev/") else None
+    except ToolError:
+        return None
+
+
+def _linux_settle(disk: str) -> None:
+    run(["partprobe", disk])
+    run(["udevadm", "settle"])
+
+
+def _linux_unmount(dev: str) -> None:
+    try:
+        targets = capture(["findmnt", "-rno", "TARGET", "-S", dev]).split()
+    except ToolError:
+        return
+    for target in targets:
+        run(["umount", target])
+
+
+def _linux_pttype(disk: str) -> str:
+    return (_lsblk(disk)[0].get("pttype") or "").lower()
+
+
+def _linux_mount(dev: str, mountpoint: Path, fs: str) -> None:
+    types = {"FAT32": ["vfat"], "NTFS": ["ntfs3", "ntfs-3g"], "EXFAT": ["exfat"]}[fs.upper()]
+    errors = []
+    for fstype in types:
+        try:
+            run(["mount", "-t", fstype, dev, str(mountpoint)])
+            return
+        except ToolError as exc:
+            errors.append(str(exc))
+    raise ToolError(f"Could not mount {dev}:\n" + "\n".join(errors))
+
+
+def _linux_create_partition(disk: str, size_gb: float, fs: str, label: str) -> dict:
+    fs = fs.upper()
+    mkfs = {
+        "FAT32": ["mkfs.vfat", "-F", "32", "-n", label],
+        "NTFS": ["mkfs.ntfs", "-F", "-Q", "-L", label],
+        "EXFAT": ["mkfs.exfat", "-n", label],
+    }
+    if fs not in mkfs:
+        raise ToolError(f"Unsupported filesystem: {fs}")
+    before = {p["path"] for p in _linux_partitions(disk)}
+    size_mib = int(size_gb * GIB) // (1024 * 1024)
+    type_code = "EF00" if fs == "FAT32" else "0700"
+    run(["sgdisk", "-n", f"0:0:+{size_mib}M", "-t", f"0:{type_code}", "-c", f"0:{label}", disk])
+    _linux_settle(disk)
+    created = [p for p in _linux_partitions(disk) if p["path"] not in before]
+    if len(created) != 1:
+        raise ToolError(f"Expected one new partition on {disk}, found {len(created)}.")
+    dev = created[0]["path"]
+    _linux_unmount(dev)
+    run(mkfs[fs] + [dev], timeout=1800)
+    _linux_settle(disk)
+    fresh = next(p for p in _linux_partitions(disk) if p["path"] == dev)
+    if not fresh["guid"]:
+        raise ToolError("New partition reported no GUID; refusing to continue.")
+    return {
+        "partition": fresh["number"],
+        "guid": fresh["guid"],
+        "letter": "",
+        "label": fresh["label"],
+        "path": dev,
+    }
+
+
+def _efi_entries() -> tuple[list[tuple[str, str]], list[str]]:
+    """(id, label) for every UEFI boot entry, and the current BootOrder."""
+    entries, order = [], []
+    for line in capture(["efibootmgr"]).splitlines():
+        match = EFI_ENTRY_RE.match(line)
+        if match:
+            label = match.group(2).split("\t")[0].strip()
+            entries.append((match.group(1).upper(), label))
+        elif line.startswith("BootOrder:"):
+            order = [x.strip().upper() for x in line.split(":", 1)[1].split(",") if x.strip()]
+    return entries, order
+
+
+def _linux_find_boot_entries(description: str) -> list[str]:
+    try:
+        entries, _order = _efi_entries()
+    except ToolError:
+        return []
+    needle = description.lower()
+    return [entry_id for entry_id, label in entries if needle in label.lower()]
+
+
+def _linux_create_boot_entry(part: dict, disk: str, efi_path: str, description: str) -> str:
+    before = {entry_id for entry_id, _ in _efi_entries()[0]}
+    run(["efibootmgr", "--create", "--disk", disk, "--part", str(part["partition"]),
+         "--label", description, "--loader", efi_path])
+    entries, order = _efi_entries()
+    created = [entry_id for entry_id, label in entries if entry_id not in before and label == description]
+    if len(created) != 1:
+        raise ToolError(f"Could not find the new UEFI boot entry '{description}' after creating it.")
+    guid = created[0]
+    run(["efibootmgr", "-o", ",".join([guid] + [o for o in order if o != guid])])
+    return guid
+
+
+def _linux_remove_partition(disk: str, guid: str) -> bool:
+    match = [p for p in _linux_partitions(disk) if p["guid"] == guid.lower()]
+    if not match:
+        return False
+    part = match[0]
+    _linux_unmount(part["path"])
+    run(["sgdisk", "-d", str(part["number"]), disk])
+    _linux_settle(disk)
+    return True
+
+
+def _linux_disk_guid(disk: str) -> str:
+    match = re.search(r"Disk identifier \(GUID\): ([0-9A-Fa-f-]+)", capture(["sgdisk", "-p", disk]))
+    return match.group(1).lower() if match else ""
+
+
+def _relaunch_linux() -> None:
+    keep = ["DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY", "XDG_RUNTIME_DIR",
+            "DBUS_SESSION_BUS_ADDRESS", "XDG_CURRENT_DESKTOP", "LANG"]
+    env = [f"{key}={os.environ[key]}" for key in keep if os.environ.get(key)]
+    appimage = os.environ.get("APPIMAGE")
+    if appimage:
+        # Root cannot read the user's FUSE mount, so let the runtime extract it.
+        target = [appimage, "--appimage-extract-and-run"]
+    else:
+        target = [sys.executable, str(Path(__file__).resolve())]
+    subprocess.Popen(["pkexec", "env", *env, *target, *sys.argv[1:]])
+
+
+@dataclass
+class IsoImage:
+    """Read-only access to one ISO's files, by POSIX path relative to the image root."""
+    names: list[str]
+    extract: Callable[[str, Path], None]
+    label: str
 
 
 # --------------------------------------------------------------- ISO work ----
@@ -335,40 +666,80 @@ def unmount_iso(path: str) -> None:
         pass
 
 
+def _linux_iso_label(iso: str) -> str:
+    try:
+        return capture(["blkid", "-o", "value", "-s", "LABEL", iso]).strip()
+    except ToolError:
+        return ""
+
+
+def _linux_open_iso(iso: str) -> IsoImage:
+    raw_by_name: dict[str, str] = {}
+    for raw in capture(["bsdtar", "-tf", iso]).splitlines():
+        if not raw or raw.endswith("/"):
+            continue
+        raw_by_name[re.sub(r"^(\./|/)+", "", raw)] = raw
+
+    def extract(rel: str, dst: Path) -> None:
+        with open(dst, "wb") as out:
+            proc = subprocess.run(["bsdtar", "-xOf", iso, raw_by_name[rel]],
+                                  stdout=out, stderr=subprocess.PIPE)
+        if proc.returncode != 0:
+            raise ToolError(f"Could not read {rel} from the ISO:\n{proc.stderr.decode(errors='replace')}")
+
+    return IsoImage(names=sorted(raw_by_name), extract=extract, label=_linux_iso_label(iso))
+
+
+@contextlib.contextmanager
+def open_iso(iso: str):
+    """Yield an IsoImage for the ISO. Windows mounts it; Linux reads it in place."""
+    if not IS_WINDOWS:
+        yield _linux_open_iso(iso)
+        return
+    letter, label = mount_iso(iso)
+    root = Path(f"{letter}:/")
+    try:
+        names = []
+        for dirpath, _dirnames, filenames in os.walk(root):
+            for name in filenames:
+                names.append((Path(dirpath) / name).relative_to(root).as_posix())
+        yield IsoImage(
+            names=sorted(names),
+            extract=lambda rel, dst: shutil.copyfile(root / rel, dst),
+            label=label,
+        )
+    finally:
+        unmount_iso(iso)
+
+
 def inspect_iso(path: str) -> IsoLayout:
-    """Mount the ISO, work out how to boot it, unmount. No writes."""
+    """Read the ISO, work out how to boot it, cache what install needs. No writes to disks."""
     iso = str(Path(path))
     if not Path(iso).is_file():
         raise ToolError(f"ISO not found: {iso}")
     if Path(iso).suffix.lower() != ".iso":
         raise ToolError("That file does not look like a .iso.")
 
-    letter, label = mount_iso(iso)
-    root = Path(f"{letter}:/")
-    try:
+    with open_iso(iso) as image:
+        names = image.names
         # archiso layout: <basedir>/x86_64/airootfs.sfs
-        sfs = None
-        for dirpath, _dirnames, filenames in os.walk(root):
-            p = Path(dirpath)
-            if p.name == "x86_64" and "airootfs.sfs" in filenames:
-                sfs = p / "airootfs.sfs"
-                break
-        if sfs is None:
+        sfs = [n for n in names if n.count("/") == 2
+               and n.split("/")[1].lower() == "x86_64" and n.split("/")[2].lower() == "airootfs.sfs"]
+        if not sfs:
             raise ToolError(
                 "Not an archiso image: no <basedir>/x86_64/airootfs.sfs found.\n"
                 "This tool only handles Arch, CachyOS, Omarchy, EndeavourOS, etc."
             )
-
-        basedir_dir = sfs.parent.parent
-        basedir = basedir_dir.name
-
-        boot_dir = basedir_dir / "boot" / "x86_64"
-        if not boot_dir.is_dir():
+        basedir = sfs[0].split("/")[0]
+        boot_prefix = f"{basedir}/boot/x86_64/"
+        boot_names = [n[len(boot_prefix):] for n in names
+                      if n.startswith(boot_prefix) and "/" not in n[len(boot_prefix):]]
+        if not boot_names:
             raise ToolError(f"Missing {basedir}/boot/x86_64/ inside the ISO.")
 
-        def first(pred: Callable[[str], bool]) -> Optional[Path]:
-            for entry in sorted(boot_dir.iterdir()):
-                if pred(entry.name):
+        def first(pred: Callable[[str], bool]) -> Optional[str]:
+            for entry in sorted(boot_names):
+                if pred(entry):
                     return entry
             return None
 
@@ -379,57 +750,48 @@ def inspect_iso(path: str) -> IsoLayout:
         if initrd is None:
             raise ToolError(f"No initramfs found in /{basedir}/boot/x86_64/.")
 
-        efi = root / "EFI" / "BOOT" / "BOOTx64.EFI"
-        if not efi.is_file():
+        efi_name = next((n for n in names if n.lower() == "efi/boot/bootx64.efi"), None)
+        if efi_name is None:
             raise ToolError("ISO has no EFI/BOOT/BOOTx64.EFI - it cannot be UEFI booted.")
 
-        marker_dir = root / "boot"
-        marker = None
-        if marker_dir.is_dir():
-            for entry in sorted(marker_dir.iterdir()):
-                if entry.name.endswith(".uuid"):
-                    marker = entry
-                    break
-        if marker is None:
+        marker_name = next((n for n in names if n.startswith("boot/") and n.count("/") == 1
+                            and n.endswith(".uuid")), None)
+        if marker_name is None:
             raise ToolError("No archiso marker file (/boot/*.uuid) in the ISO.")
+        marker = marker_name.split("/")[-1]
+
+        # Cache the two files install() needs, so it does not depend on the ISO
+        # being readable again later.
+        key = re.sub(r"[^A-Za-z0-9._-]+", "_", Path(iso).stem)
+        cache = CACHE_DIR / key
+        cache.mkdir(parents=True, exist_ok=True)
+        cached_efi = cache / "BOOTx64.EFI"
+        cached_marker = cache / marker
+        image.extract(efi_name, cached_efi)
+        image.extract(marker_name, cached_marker)
 
         # Verify the EFI GRUB really does marker discovery + loopback boot.
-        blob = efi.read_bytes()
-        if b"ARCHISO_HINT" not in blob or marker.name.encode() not in blob:
+        blob = cached_efi.read_bytes()
+        if b"ARCHISO_HINT" not in blob or marker.encode() not in blob:
             raise ToolError(
-                f"EFI/BOOT/BOOTx64.EFI does not reference '{marker.name}'.\n"
+                f"EFI/BOOT/BOOTx64.EFI does not reference '{marker}'.\n"
                 "Unsupported ISO build - refusing to guess."
             )
         if b"loopback" not in blob:
             raise ToolError("EFI/BOOT/BOOTx64.EFI has no GRUB loopback module.")
 
-        def rel(p: Path) -> str:
-            return "/" + p.relative_to(root).as_posix()
-
-        # The mount is about to disappear, so cache the two files we need to
-        # copy later. install() must not depend on the ISO still being mounted.
-        key = re.sub(r"[^A-Za-z0-9._-]+", "_", Path(iso).stem)
-        cache = CACHE_DIR / key
-        cache.mkdir(parents=True, exist_ok=True)
-        cached_efi = cache / "BOOTx64.EFI"
-        cached_marker = cache / marker.name
-        shutil.copyfile(efi, cached_efi)
-        shutil.copyfile(marker, cached_marker)
-
         return IsoLayout(
             path=iso,
-            label=label,
+            label=image.label,
             basedir=basedir,
-            kernel=rel(kernel),
-            initrd=rel(initrd),
-            marker=marker.name,
+            kernel=f"/{boot_prefix}{kernel}",
+            initrd=f"/{boot_prefix}{initrd}",
+            marker=marker,
             efi_src=str(cached_efi),
             marker_src=str(cached_marker),
             size_gb=os.path.getsize(iso) / GIB,
             efi_size_mb=cached_efi.stat().st_size / 1024 / 1024,
         )
-    finally:
-        unmount_iso(iso)
 
 
 # ---------------------------------------------------------- grub.cfg build ---
@@ -514,7 +876,37 @@ def render_grub_cfg(layout: IsoLayout, iso_name: str, store_label: Optional[str]
 
 # ------------------------------------------------------------------ writes ---
 
+def part_where(part: dict) -> str:
+    """Human-readable location of a partition, for log lines."""
+    return f"{part['letter']}:" if IS_WINDOWS else part["path"]
+
+
+@contextlib.contextmanager
+def partition_root(part: dict, fs: str):
+    """Yield the directory a new partition's files go into, mounting it on Linux."""
+    if IS_WINDOWS:
+        yield Path(f"{part['letter']}:/")
+        return
+    mountpoint = Path(tempfile.mkdtemp(prefix="isoboot-"))
+    _linux_mount(part["path"], mountpoint, fs)
+    try:
+        yield mountpoint
+    finally:
+        run(["sync"])
+        run(["umount", str(mountpoint)])
+        mountpoint.rmdir()
+
+
+def delete_boot_entry(entry_id: str) -> None:
+    if IS_WINDOWS:
+        run(["bcdedit", "/delete", entry_id])
+    else:
+        run(["efibootmgr", "-b", entry_id, "-B"])
+
+
 def create_partition(disk_number: int, size_gb: float, fs: str, label: str) -> dict:
+    if not IS_WINDOWS:
+        return _linux_create_partition(disk_number, size_gb, fs, label)
     size_bytes = int(size_gb * GIB)
     data = ps_json(fill("""
 $p = New-Partition -DiskNumber {{disk}} -Size {{size}} -AssignDriveLetter -ErrorAction Stop
@@ -537,14 +929,16 @@ ConvertTo-Json -InputObject $o -Compress
     return info
 
 
-def create_boot_entry(letter: str, efi_path: str, description: str) -> str:
+def create_boot_entry(part: dict, disk_number, efi_path: str, description: str) -> str:
+    if not IS_WINDOWS:
+        return _linux_create_boot_entry(part, disk_number, efi_path, description)
     out = run(["bcdedit", "/copy", "{bootmgr}", "/d", description])
     match = re.search(r"\{[0-9a-fA-F-]{36}\}", out)
     if not match:
         raise ToolError(f"Could not read the new boot entry GUID from bcdedit:\n{out}")
     guid = match.group(0)
 
-    run(["bcdedit", "/set", guid, "device", f"partition={letter}"])
+    run(["bcdedit", "/set", guid, "device", f"partition={part['letter']}:"])
     run(["bcdedit", "/set", guid, "path", efi_path])
     run(["bcdedit", "/set", guid, "description", description])
     run(["bcdedit", "/set", "{fwbootmgr}", "displayorder", guid, "/addfirst"])
@@ -577,6 +971,8 @@ def save_state(state: dict) -> None:
 def partitions_with_labels(disk_number: int, labels) -> list[dict]:
     """Partitions on this disk whose volume label is in `labels`."""
     wanted = {str(label).upper() for label in labels}
+    if not IS_WINDOWS:
+        return [p for p in _linux_partitions(disk_number) if p["label"].upper() in wanted]
     data = ps_json(fill("""
 $out = @(
   Get-Partition -DiskNumber {{disk}} -ErrorAction SilentlyContinue | ForEach-Object {
@@ -597,6 +993,8 @@ def remove_partition_by_guid(disk_number: int, guid: str) -> bool:
     """Remove a partition by GUID; partition numbers can be renumbered."""
     if not guid:
         return False
+    if not IS_WINDOWS:
+        return _linux_remove_partition(disk_number, guid)
     out = ps(fill("""
 $p = Get-Partition -DiskNumber {{d}} -ErrorAction SilentlyContinue |
      Where-Object { [string]$_.Guid -eq {{g}} }
@@ -647,7 +1045,7 @@ def preflight(
         if not remove_partition_by_guid(disk_number, part.get("guid", "")):
             raise ToolError(
                 f"Leftover partition '{part['label']}' exists but could not be removed. "
-                "Delete it in Disk Management, then try again."
+                "Delete it with your partition tool (Windows: Disk Management), then try again."
             )
 
     legacy = partitions_with_labels(disk_number, LEGACY_LABELS)
@@ -662,13 +1060,18 @@ def preflight(
 
     for guid in find_boot_entries(description):
         try:
-            run(["bcdedit", "/delete", guid])
+            delete_boot_entry(guid)
             on_log(f"Removed stale boot entry {guid}")
         except ToolError as exc:
             on_log(f"Could not remove stale boot entry {guid}: {exc}")
 
 
 def disk_guid(disk_number: int) -> str:
+    if not IS_WINDOWS:
+        try:
+            return _linux_disk_guid(disk_number)
+        except ToolError:
+            return ""
     try:
         return ps(fill("(Get-Disk -Number {{d}} -ErrorAction SilentlyContinue).Guid", d=disk_number)).strip()
     except Exception:
@@ -687,6 +1090,13 @@ def install(
     """Create partitions, populate them, register the boot entry."""
     if not is_admin():
         raise ToolError("Administrator rights are required to create partitions.")
+    if not IS_WINDOWS:
+        missing = missing_linux_tools()
+        if missing:
+            raise ToolError("Missing tools: " + ", ".join(missing) + "\nInstall them with:\n  "
+                            + linux_install_hint())
+        if _linux_pttype(disk_number) != "gpt":
+            raise ToolError(f"{disk_number} is not GPT. Refusing to write to it.")
 
     iso_name = Path(layout.path).name
     iso_bytes = os.path.getsize(layout.path)
@@ -700,7 +1110,7 @@ def install(
 
     on_log(f"Creating {loader_gb:g} GB FAT32 loader partition ...")
     loader = create_partition(disk_number, loader_gb, "FAT32", loader_label)
-    on_log(f"  loader -> partition {loader['partition']}, {loader['letter']}: (FAT32)")
+    on_log(f"  loader -> partition {loader['partition']}, {part_where(loader)} (FAT32)")
 
     on_log(f"Creating {store_gb:g} GB {filesystem} ISO store ...")
     try:
@@ -713,7 +1123,7 @@ def install(
         except Exception:
             pass
         raise
-    on_log(f"  store  -> partition {store['partition']}, {store['letter']}: ({filesystem})")
+    on_log(f"  store  -> partition {store['partition']}, {part_where(store)} ({filesystem})")
     if store["label"].upper() != store_label:
         raise ToolError(
             f"Store volume label is '{store['label']}', expected {store_label}. "
@@ -727,7 +1137,7 @@ def install(
         "Version": VERSION,
         "EntryGuid": None,
         "EntryDescription": description,
-        "DiskNumber": int(disk_number),
+        "DiskNumber": disk_number,
         "DiskGuid": disk_guid(disk_number),
         "LoaderPartition": int(loader["partition"]),
         "LoaderPartitionGuid": loader["guid"],
@@ -735,8 +1145,10 @@ def install(
         "StorePartitionGuid": store["guid"],
         "LoaderLabel": loader_label,
         "StoreLabel": store_label,
-        "LoaderLetter": f"{loader['letter']}:",
-        "StoreLetter": f"{store['letter']}:",
+        "LoaderLetter": f"{loader['letter']}:" if loader["letter"] else None,
+        "StoreLetter": f"{store['letter']}:" if store["letter"] else None,
+        "LoaderPath": loader.get("path"),
+        "StorePath": store.get("path"),
         "IsoPath": layout.path,
         "IsoFile": iso_name,
         "Complete": False,
@@ -744,30 +1156,31 @@ def install(
     save_state(state)
 
     # 1. EFI loader
-    efi_dst_dir = Path(f"{loader['letter']}:/EFI/BOOT")
-    efi_dst_dir.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(layout.efi_src, efi_dst_dir / "BOOTx64.EFI")
+    with partition_root(loader, "FAT32") as loader_root:
+        efi_dst_dir = loader_root / "EFI" / "BOOT"
+        efi_dst_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(layout.efi_src, efi_dst_dir / "BOOTx64.EFI")
     on_log("  copied EFI/BOOT/BOOTx64.EFI")
 
-    # 2. marker + grub.cfg
-    boot_dir = Path(f"{store['letter']}:/boot")
-    grub_dir = boot_dir / "grub"
-    grub_dir.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(layout.marker_src, boot_dir / layout.marker)
-    (grub_dir / "grub.cfg").write_text(
-        render_grub_cfg(layout, iso_name, store_label), encoding="ascii", newline="\n"
-    )
-    on_log(f"  wrote boot/{layout.marker} and boot/grub/grub.cfg")
+    # 2. marker + grub.cfg, 3. the ISO itself
+    with partition_root(store, filesystem) as store_root:
+        boot_dir = store_root / "boot"
+        grub_dir = boot_dir / "grub"
+        grub_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(layout.marker_src, boot_dir / layout.marker)
+        (grub_dir / "grub.cfg").write_text(
+            render_grub_cfg(layout, iso_name, store_label), encoding="ascii", newline="\n"
+        )
+        on_log(f"  wrote boot/{layout.marker} and boot/grub/grub.cfg")
 
-    # 3. the ISO itself
-    on_log(f"  copying {iso_name} ({iso_bytes / GIB:.2f} GB) - this takes a few minutes")
-    copy_with_progress(layout.path, str(Path(f"{store['letter']}:/{iso_name}")),
-                       on_progress, f"copying {iso_name}")
+        on_log(f"  copying {iso_name} ({iso_bytes / GIB:.2f} GB) - this takes a few minutes")
+        copy_with_progress(layout.path, str(store_root / iso_name),
+                           on_progress, f"copying {iso_name}")
 
     # 4. firmware entry
     on_log("Registering the UEFI boot entry ...")
-    guid = create_boot_entry(f"{loader['letter']}:", ENTRY_PATH, description)
-    on_log(f"  boot entry {guid} -> {loader['letter']}:{ENTRY_PATH}")
+    guid = create_boot_entry(loader, disk_number, ENTRY_PATH, description)
+    on_log(f"  boot entry {guid} -> {part_where(loader)}{ENTRY_PATH}")
 
     state["EntryGuid"] = guid
     state["Complete"] = True
@@ -802,7 +1215,7 @@ def remove_previous(on_log: Callable[[str], None]) -> int:
             unique.append(guid)
     for guid in unique:
         try:
-            run(["bcdedit", "/delete", guid])
+            delete_boot_entry(guid)
             on_log(f"Deleted boot entry {guid}")
             performed += 1
         except ToolError as exc:
@@ -862,10 +1275,19 @@ def launch_gui(build_only: bool = False) -> int:
     import tkinter as tk
     from tkinter import filedialog, messagebox, ttk
 
+    ui_font = "Segoe UI" if IS_WINDOWS else "Sans"
+    mono_font = "Consolas" if IS_WINDOWS else "Monospace"
+    system_name = "Windows" if IS_WINDOWS else "the running Linux system"
+
     class App(tk.Tk):
         def __init__(self) -> None:
             super().__init__()
             self.title(APP_TITLE)
+            # Under XWayland an unset cursor is invisible; say what we want explicitly,
+            # including for Tk's own file and message dialogs.
+            self.configure(cursor="arrow")
+            self.option_add("*TkFDialog.cursor", "arrow")
+            self.option_add("*Dialog.cursor", "arrow")
             self.geometry("860x780")
             self.minsize(780, 700)
 
@@ -876,14 +1298,15 @@ def launch_gui(build_only: bool = False) -> int:
             self.disks: list[dict] = []
             self.admin = is_admin()
             self.firmware_ok = True
+            self.tools_ok = True
             self.has_state = STATE_FILE.is_file()
             self.secure_boot: Optional[bool] = None
 
             style = ttk.Style(self)
             if "vista" in style.theme_names():
                 style.theme_use("vista")
-            style.configure("H1.TLabel", font=("Segoe UI", 15, "bold"))
-            style.configure("H2.TLabel", font=("Segoe UI", 10, "bold"))
+            style.configure("H1.TLabel", font=(ui_font, 15, "bold"))
+            style.configure("H2.TLabel", font=(ui_font, 10, "bold"))
             style.configure("Dim.TLabel", foreground="#555")
             style.configure("Ok.TLabel", foreground="#0a7d28")
             style.configure("Bad.TLabel", foreground="#b00020")
@@ -930,7 +1353,7 @@ def launch_gui(build_only: bool = False) -> int:
             ttk.Button(row, text="Inspect", command=self._on_inspect).pack(side="left", padx=(6, 0))
 
             self.txt_iso = tk.Text(frm_iso, height=6, wrap="none", relief="flat",
-                                   background="#f6f6f6", font=("Consolas", 9))
+                                   background="#f6f6f6", font=(mono_font, 9))
             self.txt_iso.pack(fill="x", pady=(6, 0))
             self.txt_iso.configure(state="disabled")
 
@@ -994,7 +1417,7 @@ def launch_gui(build_only: bool = False) -> int:
             frm_log.pack(fill="both", expand=True, **pad)
             self.txt_log = tk.Text(frm_log, height=12, wrap="word", relief="flat",
                                    background="#111318", foreground="#d8dee9",
-                                   insertbackground="#d8dee9", font=("Consolas", 9))
+                                   insertbackground="#d8dee9", font=(mono_font, 9))
             self.txt_log.pack(side="left", fill="both", expand=True)
             sb = ttk.Scrollbar(frm_log, command=self.txt_log.yview)
             sb.pack(side="right", fill="y")
@@ -1014,7 +1437,7 @@ def launch_gui(build_only: bool = False) -> int:
                 self.btn_create.configure(state="disabled")
                 self.btn_remove.configure(state="disabled")
                 return
-            can_create = (self.admin and self.firmware_ok and not self.has_state
+            can_create = (self.admin and self.firmware_ok and self.tools_ok and not self.has_state
                           and self.layout is not None and self.plan_ok)
             self.btn_create.configure(state="normal" if can_create else "disabled")
             self.btn_remove.configure(state="normal" if self.admin else "disabled")
@@ -1062,6 +1485,11 @@ def launch_gui(build_only: bool = False) -> int:
                 sb = get_secure_boot()
                 self.q.put(("invoke", lambda: self._apply_probe(fw, sb)))
             threading.Thread(target=probe, daemon=True).start()
+            missing = missing_linux_tools()
+            if missing:
+                self.tools_ok = False
+                self.log("Missing tools: " + ", ".join(missing))
+                self.log("Install them with: " + linux_install_hint())
             self._on_refresh()
 
             # Auto-inspect the newest ISO in Downloads so the app is useful on open.
@@ -1206,7 +1634,7 @@ def launch_gui(build_only: bool = False) -> int:
             bits = [f"{len(parts)} existing partition(s)"]
             sysdisk = system_disk_number()
             if sysdisk == disk["number"]:
-                bits.append("contains Windows - only free space is touched")
+                bits.append(f"contains {system_name} - only free space is touched")
             if disk["style"].upper() != "GPT":
                 bits.append("NOT GPT - UEFI needs GPT")
             if disk["freeGB"] < 10:
@@ -1295,7 +1723,8 @@ def launch_gui(build_only: bool = False) -> int:
             warn = ""
             if system_disk_number() == disk["number"]:
                 warn = ("\n\nThis disk also holds Windows. Only unallocated space is used, but "
-                        "make sure you have your BitLocker recovery key.")
+                        "make sure you have your BitLocker recovery key.") if IS_WINDOWS else (
+                        "\n\nThis disk also holds the running system. Only unallocated space is used.")
 
             layout = self.layout
             fs = self.var_fs.get()
@@ -1361,7 +1790,7 @@ def launch_gui(build_only: bool = False) -> int:
                 "Remove",
                 "Delete the UEFI boot entry and the loader + store partitions "
                 "created by this tool?\n\nThe space becomes unallocated again. "
-                "Windows is not touched.",
+                f"{'Windows' if IS_WINDOWS else 'Other partitions'} is not touched.",
                 parent=self,
             ):
                 return
@@ -1423,6 +1852,9 @@ def selftest() -> int:
     print(f"admin       : {is_admin()}")
     print(f"firmware    : {get_firmware_type()}")
     print(f"secure boot : {get_secure_boot()}")
+    if not IS_WINDOWS:
+        missing = missing_linux_tools()
+        print(f"tools       : {'all present' if not missing else 'missing ' + ', '.join(missing)}")
 
     print("\n-- disks --")
     try:
@@ -1478,8 +1910,10 @@ Usage:
   python omarchy_iso_boot.py --version    print the version
   python omarchy_iso_boot.py --help       show this text
 
-Requirements: Windows 10/11, UEFI + GPT, Python 3.9+ with tkinter,
-Administrator rights for the write steps, Secure Boot disabled.
+Requirements: Windows 10/11 or Linux, UEFI + GPT, Python 3.9+ with tkinter,
+Administrator rights (root on Linux) for the write steps, Secure Boot disabled.
+Linux needs gptfdisk, parted, dosfstools, ntfsprogs, exfatprogs, efibootmgr,
+libarchive (bsdtar), util-linux, systemd (udevadm) and polkit (pkexec).
 
 The ISO is validated before anything is written: it must contain
 <basedir>/x86_64/airootfs.sfs, a /boot/*.uuid marker, and an

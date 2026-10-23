@@ -8,10 +8,43 @@ Target: **Windows 10/11, UEFI + GPT**. Validated against `omarchy-4.0.6.iso`.
 
 | File | Use |
 |---|---|
-| `omarchy_iso_boot.py` | **the program** — GUI + CLI, Python 3.9+, no dependencies |
+| `omarchy_iso_boot.py` | **the program** — GUI + CLI, Python 3.9+, no dependencies (Windows and Linux) |
 | `Run GUI.bat` | double-click launcher for the GUI |
 | `Install-LinuxBootPartition.ps1` | older headless PowerShell version (Omarchy labels hard-coded) |
+| `packaging/appimage/` | builds the Linux AppImage (see [Linux version](#linux-version)) |
 | `screenshots/` | walkthrough images for [setup](#step-by-step-with-screenshots) and [first boot](#first-boot-with-screenshots) |
+
+## Linux version
+
+The same program runs on Linux (tested on Omarchy/Arch). It does the same job:
+a FAT32 loader and an ISO store carved from unallocated GPT space, plus a UEFI
+boot entry. Nothing is mounted from the ISO; it is read with `bsdtar`.
+
+Runtime tools (Arch/Omarchy):
+
+```bash
+sudo pacman -S --needed gptfdisk parted dosfstools ntfsprogs exfatprogs efibootmgr libarchive tk polkit
+```
+
+Run it from source (`sudo python3 omarchy_iso_boot.py` or use the GUI's
+**Relaunch as Administrator**, which uses `pkexec`), or use the AppImage:
+
+```bash
+packaging/appimage/build.sh                # -> dist/Linux ISO Boot Installer-x86_64.AppImage
+chmod +x "dist/Linux ISO Boot Installer-x86_64.AppImage"
+"dist/Linux ISO Boot Installer-x86_64.AppImage"
+```
+
+The build needs network access. It downloads a Python AppImage base and
+`appimagetool`. The AppImage bundles Python and tkinter, so the target system
+only needs the runtime tools above.
+
+Linux-specific behaviour:
+
+* State lives in `/var/lib/linux-iso-boot/state.json`.
+* Disks are shown by device path (`/dev/nvme0n1`); partitions are tracked by PARTUUID.
+* Free space shown is the largest unpartitioned gap, because a partition must fit in one run.
+* Remove deletes UEFI entries by name suffix `(live ISO on disk)`, the same as the Windows version.
 
 ## Requirements
 

@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Linux ISO Boot Installer
+Comment=Boot an archiso-family ISO from an internal disk, no USB
+Exec=linux-iso-boot
+Icon=linux-iso-boot
+Categories=System;
+Terminal=false
