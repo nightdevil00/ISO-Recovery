@@ -26,18 +26,58 @@ Runtime tools (Arch/Omarchy):
 sudo pacman -S --needed gptfdisk parted dosfstools ntfsprogs exfatprogs efibootmgr libarchive tk polkit
 ```
 
-Run it from source (`sudo python3 omarchy_iso_boot.py` or use the GUI's
-**Relaunch as Administrator**, which uses `pkexec`), or use the AppImage:
+### Get the AppImage
+
+Download `Linux ISO Boot Installer-x86_64.AppImage` from the
+[latest release](https://github.com/nightdevil00/ISO-Recovery/releases/latest),
+or build it yourself with `packaging/appimage/build.sh` (needs network access; it
+downloads a Python AppImage base and `appimagetool`).
+
+Make it executable and start it:
 
 ```bash
-packaging/appimage/build.sh                # -> dist/Linux ISO Boot Installer-x86_64.AppImage
-chmod +x "dist/Linux ISO Boot Installer-x86_64.AppImage"
-"dist/Linux ISO Boot Installer-x86_64.AppImage"
+chmod +x "Linux ISO Boot Installer-x86_64.AppImage"
+./"Linux ISO Boot Installer-x86_64.AppImage"
 ```
 
-The build needs network access. It downloads a Python AppImage base and
-`appimagetool`. The AppImage bundles Python and tkinter, so the target system
-only needs the runtime tools above.
+The AppImage bundles Python and tkinter, so the target system only needs the
+runtime tools above.
+
+### Running on Wayland (Hyprland, Sway, ...)
+
+The GUI is a Tk app, so it runs through XWayland. Two things make it work:
+
+1. **Grant root access to the X display.** The GUI starts read-only. **Relaunch as
+   Administrator** starts a root copy, which has to draw on your display. Allow
+   local root once per session:
+
+   ```bash
+   sudo pacman -S --needed xorg-xhost
+   xhost +si:localuser:root
+   ```
+
+   `xhost` lists the current access list. The grant lasts until you log out. To
+   remove it early: `xhost -si:localuser:root`.
+
+2. **Don't start the GUI with `sudo`.** `sudo` strips `DISPLAY`, so the window
+   can't open. Start it normally and click **Relaunch as Administrator**. That
+   runs `pkexec` and asks for your password through your polkit agent.
+
+If you need a root shell instead of the button, keep the display variables:
+
+```bash
+sudo env DISPLAY="$DISPLAY" ./"Linux ISO Boot Installer-x86_64.AppImage"
+```
+
+The elevated window's output goes to `/tmp/linux-iso-boot-relaunch.log`. If the
+root window doesn't appear, look there first.
+
+### Running from source
+
+```bash
+python3 omarchy_iso_boot.py           # GUI; use Relaunch as Administrator for writes
+sudo python3 omarchy_iso_boot.py --selftest
+```
 
 Linux-specific behaviour:
 

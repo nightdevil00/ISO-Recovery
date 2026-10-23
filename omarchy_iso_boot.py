@@ -613,7 +613,12 @@ def _relaunch_linux() -> None:
         target = [appimage, "--appimage-extract-and-run"]
     else:
         target = [sys.executable, str(Path(__file__).resolve())]
-    subprocess.Popen(["pkexec", "env", *env, *target, *sys.argv[1:]])
+    # setsid -f detaches pkexec from this process; otherwise the elevated window
+    # dies as soon as this (read-only) window closes.
+    log = Path(tempfile.gettempdir()) / "linux-iso-boot-relaunch.log"
+    with open(log, "w", encoding="utf-8") as out:
+        subprocess.run(["setsid", "-f", "pkexec", "env", *env, *target, *sys.argv[1:]],
+                       stdin=subprocess.DEVNULL, stdout=out, stderr=out)
 
 
 @dataclass
