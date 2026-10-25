@@ -4,6 +4,17 @@ Makes an archiso-family ISO — **Omarchy**, Arch, CachyOS, EndeavourOS, … —
 bootable straight from free space on an internal disk. No USB stick, no second
 machine. Then you install Linux for real onto the space that is left.
 
+> **Built for dual-boot — this is a Linux-alongside-Windows tool, not a
+> wipe-the-disk tool.**
+>
+> It only uses **unallocated** space: no existing partition is resized, moved or
+> written to, so Windows keeps booting.
+>
+> When you install Linux from the live session, choose the installer's
+> **Free space install** option. That is the whole point of this setup — it
+> installs into the free space and leaves Windows where it is. The full-disk /
+> erase-disk option is not what this tool is for.
+
 Target: **Windows 10/11, UEFI + GPT**. Validated against `omarchy-4.0.6.iso`.
 
 | File | Use |
@@ -112,6 +123,9 @@ The app opens **read-only** and:
 Then click **Relaunch as Administrator** and **Create bootable partition**.
 The Create button stays disabled until everything checks out.
 
+Reboot into the live ISO, then install Linux with **Free space install** — see
+[Installing Linux for real](#installing-linux-for-real--choose-free-space-install).
+
 ## Step by step (with screenshots)
 
 ### 1. Prepare the disk — shrink a volume first
@@ -178,7 +192,7 @@ name, so they are unique per ISO and fit FAT32's 11-character limit:
     \boot\2026-10-19-22-18-53-00.uuid  <- marker file from the ISO
     \boot\grub\grub.cfg                <- generated: loopback-boots the ISO
 
-[ remaining free space ]               <- your real Omarchy installation
+[ remaining free space ]               <- your real Linux install (Free space install)
 ```
 
 The boot entry is named after the ISO, e.g. **`Omarchy 4.0.6 (live ISO on disk)`**.
@@ -302,6 +316,9 @@ not have the preflight/GUID protections above. Prefer the Python program.
 * **Turn Secure Boot off** in firmware setup.
 * **Note your BitLocker recovery key** if `C:` is encrypted
   (`manage-bde -status C:`). Only free space is touched, but keep it handy.
+* **Installing Omarchy alongside Windows needs BitLocker off.** Omarchy's
+  dual-boot install is not compatible with BitLocker on that disk — decrypt `C:`
+  first (Settings → Privacy & Security → Device encryption).
 * The boot entry is added **first** in the boot order. Windows still appears in
   the firmware boot menu.
 
@@ -335,13 +352,26 @@ live environment. The first Omarchy screen means the whole chain worked: firmwar
 
 [![Omarchy live environment first screen](screenshots/omarchy_setup.jpg)](screenshots/omarchy_setup.jpg)
 
-## Installing Omarchy for real
+## Installing Linux for real — choose **Free space install**
 
-You land in the live environment. Install onto the remaining free space.
+You land in the live environment and the installer asks how to use the disk.
+This is the step that decides whether you get a dual-boot, so pick carefully.
 
-* Leave the loader partition alone and point `/efi` at it — it is already FAT32
-  and becomes your permanent ESP.
-* Do **not** install onto the store partition — the live system is reading from it.
+1. **Select the disk** that holds the unallocated space you prepared.
+2. **Choose `Free space install`.** That option installs into the free space and
+   leaves every existing partition — Windows included — exactly where it is.
+   **Do not** choose the full-disk / erase-disk option: it deletes Windows and
+   the loader this tool just created.
+3. **Install into the free space left after the store partition.** Leave the
+   1 GB loader partition alone (do not reformat it) and point `/efi` at it — it
+   is already FAT32 and becomes your permanent EFI partition.
+4. **Do not** install onto the ~9 GB store partition — the live system is reading
+   the ISO from it.
+5. Finish the install as usual.
+
+Because the loader partition becomes your `/efi`, **Remove previous setup** is
+only an undo for *before* you install. Running it afterwards deletes both
+temporary partitions, including the one now holding your bootloader.
 
 ## If it does not boot
 
